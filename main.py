@@ -90,30 +90,30 @@ def parse_config_to_xray_json(config_url: str):
 
 async def test_config_with_xray(config_url: str) -> bool:
     """
-    یک کانفیگ را با استفاده از Xray -test تست می‌کند (تست تاخیر واقعی).
+    یک کانفیگ را با استفاده از Xray -test تست می‌کند و خطاهای دقیق را نمایش می‌دهد.
     """
     outbound_config = parse_config_to_xray_json(config_url)
     if not outbound_config:
         return False
 
-    # ساخت فایل کانفیگ موقت برای تست
     test_config_json = {
         "inbounds": [],
         "outbounds": [outbound_config],
-        "routing": {
-            "rules": [{"type": "field", "outboundTag": "proxy", "domain": ["google.com"]}]
-        }
+        "routing": { "rules": [{"type": "field", "outboundTag": "proxy", "domain": ["google.com"]}] }
     }
     
-    # استفاده از یک نام فایل منحصر به فرد برای جلوگیری از تداخل در اجرای همزمان
     temp_filename = f"temp_config_{uuid.uuid4()}.json"
     with open(temp_filename, 'w') as f:
         json.dump(test_config_json, f)
 
     try:
-        print(f"[*] تست تاخیر واقعی: {unquote(urlparse(config_url).fragment or 'N/A')}...")
+        # استخراج نام و آدرس سرور برای نمایش در لاگ
+        config_name = unquote(urlparse(config_url).fragment or 'N/A')
+        server_address = outbound_config.get("settings", {}).get("vnext", [{}])[0].get("address") or \
+                         outbound_config.get("settings", {}).get("servers", [{}])[0].get("address")
         
-        # اجرای Xray برای تست کانفیگ با یک مهلت زمانی مشخص
+        print(f"[*] تست '{config_name}' به سرور {server_address}...")
+        
         process = await asyncio.create_subprocess_exec(
             XRAY_PATH, '-test', temp_filename,
             stdout=subprocess.PIPE,
@@ -123,21 +123,25 @@ async def test_config_with_xray(config_url: str) -> bool:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=CONFIG_TEST_TIMEOUT)
         
         output = stdout.decode('utf-8')
+        error_output = stderr.decode('utf-8').strip()
+
         if "Success" in output:
             delay = re.search(r'\((\d+)\s*ms\)', output)
             print(f"[+] موفقیت‌آمیز ({delay.group(1) if delay else 'N/A'} ms)")
             return True
         else:
-            print(f"[-] ناموفق")
+            # نمایش خطای دقیق از Xray
+            print(f"[-] ناموفق. خطای Xray: {error_output}")
             return False
+            
     except asyncio.TimeoutError:
         print("[-] ناموفق (تایم‌اوت)")
         return False
     except Exception as e:
-        print(f"[-] ناموفق (خطای اجرایی: {e})")
+        error_output = locals().get('stderr', b'').decode('utf-8').strip()
+        print(f"[-] ناموفق (خطای اجرایی: {e}). خطای Xray: {error_output}")
         return False
     finally:
-        # پاک کردن فایل کانفیگ موقت
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
 
@@ -184,7 +188,6 @@ async def main():
     results = await asyncio.gather(*tasks)
     working_configs = [config for config, is_working in zip(all_configs_to_test, results) if is_working]
     
-    # مرتب‌سازی بر اساس نام برای داشتن خروجی یکسان
     working_configs.sort()
     
     print(f"\n✅ تست تمام شد. تعداد نهایی کانفیگ‌های سالم: {len(working_configs)}")
