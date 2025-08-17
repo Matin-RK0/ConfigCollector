@@ -32,9 +32,14 @@ jobs:
           CHANNEL_USERNAMES: ${{ secrets.CHANNEL_USERNAMES }}
 
       - name: Commit and push if changed
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add subscription.txt
-          git diff --staged --quiet || git commit -m "Update subscription file"
-          git push
+          run: |
+            if [ -f subscription.txt ]; then
+              echo "✅ Subscription file found. Committing changes..."
+              git config --global user.name "github-actions[bot]"
+              git config --global user.email "github-actions[bot]@users.noreply.github.com"
+              git add subscription.txt
+              git diff --staged --quiet || git commit -m "Update subscription file"
+              git push
+            else
+              echo "⚠️ Subscription file not found. No new working configs were found in this run."
+            fi
