@@ -1,45 +1,62 @@
+# نام Workflow شما
 name: V2Ray Config Extractor
 
+# تریگرها: چه زمانی این اسکریپت اجرا شود
 on:
-  workflow_dispatch: # برای اجرای دستی
+  # این خط به شما اجازه می‌دهد دکمه "Run workflow" را برای اجرای دستی داشته باشید
+  workflow_dispatch:
+  
+  # این بخش اسکریپت را به صورت زمان‌بندی شده اجرا می‌کند
   schedule:
-    - cron: '*/30 * * * *' # هر 30 دقیقه
+    # هر 30 دقیقه یک بار اجرا می‌شود
+    - cron: '*/30 * * * *'
 
+# تعریف کارها (Jobs)
 jobs:
   build:
+    # استفاده از یک ماشین مجازی اوبونتو برای اجرای کد
     runs-on: ubuntu-latest
 
+    # مراحل اجرای کار
     steps:
+      # مرحله ۱: دانلود کردن کدهای ریپازیتوری شما روی ماشین مجازی
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # مرحله ۲: نصب و راه‌اندازی نسخه مشخصی از پایتون
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
+      # مرحله ۳: نصب کتابخانه‌های پایتون که در فایل requirements.txt لیست شده‌اند
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
+      
+      # مرحله ۴: اجرای اسکریپت اصلی پایتون
       - name: Run the script
         run: python main.py
         env:
+          # خواندن اطلاعات حساس از GitHub Secrets
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           SESSION_STRING: ${{ secrets.SESSION_STRING }}
           CHANNEL_USERNAMES: ${{ secrets.CHANNEL_USERNAMES }}
 
+      # مرحله ۵: کامیت کردن فایل نتیجه، فقط در صورت وجود تغییرات
       - name: Commit and push if changed
-          run: |
-            if [ -f subscription.txt ]; then
-              echo "✅ Subscription file found. Committing changes..."
-              git config --global user.name "github-actions[bot]"
-              git config --global user.email "github-actions[bot]@users.noreply.github.com"
-              git add subscription.txt
-              git diff --staged --quiet || git commit -m "Update subscription file"
-              git push
-            else
-              echo "⚠️ Subscription file not found. No new working configs were found in this run."
-            fi
+        run: |
+          # ابتدا بررسی کن که آیا فایل اصلا ساخته شده است یا نه
+          if [ -f subscription.txt ]; then
+            echo "✅ Subscription file found. Committing changes..."
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git add subscription.txt
+            # فقط در صورتی کامیت کن که فایل تغییری کرده باشد
+            git diff --staged --quiet || git commit -m "Update subscription file"
+            git push
+          else
+            echo "⚠️ Subscription file not found. No new working configs were found in this run."
+          fi
