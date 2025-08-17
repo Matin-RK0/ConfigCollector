@@ -17,10 +17,10 @@ API_HASH = os.environ.get("API_HASH")
 SESSION_STRING = os.environ.get("SESSION_STRING")
 CHANNEL_USERNAMES = [channel.strip() for channel in os.environ.get("CHANNEL_USERNAMES", "").split(',')]
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")
-MESSAGE_LIMIT_PER_CHANNEL = 75  # کمی بیشتر جستجو می‌کنیم
+MESSAGE_LIMIT_PER_CHANNEL = 75
 OUTPUT_FILE = "subscription.txt"
-XRAY_PATH = "./xray"  # مسیر فایل اجرایی Xray
-CONFIG_TEST_TIMEOUT = 15 # ثانیه
+XRAY_PATH = "./xray"
+CONFIG_TEST_TIMEOUT = 15
 
 # Regex برای پیدا کردن کل لینک کانفیگ
 config_pattern = re.compile(r'\b(?:vless|vmess|trojan)://[^\s<>"\'`]+')
@@ -28,11 +28,9 @@ config_pattern = re.compile(r'\b(?:vless|vmess|trojan)://[^\s<>"\'`]+')
 def parse_config_to_xray_json(config_url: str):
     """
     لینک کانفیگ را به یک دیکشنری JSON برای outbound در Xray تبدیل می‌کند.
-    این تابع از ساختار پیچیده کانفیگ‌ها پشتیبانی می‌کند.
     """
     try:
         if config_url.startswith("vmess://"):
-            # اطمینان از اینکه طول رشته برای base64 معتبر است
             b64_part = config_url[8:]
             b64_part += '=' * (-len(b64_part) % 4)
             decoded_part = base64.b64decode(b64_part).decode('utf-8')
@@ -77,7 +75,6 @@ def parse_config_to_xray_json(config_url: str):
             else: # trojan
                 config["settings"]["servers"] = [{"address": parsed.hostname, "port": parsed.port, "password": user_info}]
         
-        # پاک‌سازی مقادیر None
         if config["streamSettings"]["security"] == "none":
             config["streamSettings"]["security"] = ""
         if "tlsSettings" in config["streamSettings"] and not config["streamSettings"]["tlsSettings"]["serverName"]:
@@ -96,10 +93,16 @@ async def test_config_with_xray(config_url: str) -> bool:
     if not outbound_config:
         return False
 
+    # بهبود فایل کانفیگ تست با افزودن لاگ دقیق و تغییر هدف تست
     test_config_json = {
+        "log": {
+            "loglevel": "debug"
+        },
         "inbounds": [],
         "outbounds": [outbound_config],
-        "routing": { "rules": [{"type": "field", "outboundTag": "proxy", "domain": ["google.com"]}] }
+        "routing": {
+            "rules": [{"type": "field", "outboundTag": "proxy", "domain": ["www.gstatic.com"]}]
+        }
     }
     
     temp_filename = f"temp_config_{uuid.uuid4()}.json"
@@ -107,7 +110,6 @@ async def test_config_with_xray(config_url: str) -> bool:
         json.dump(test_config_json, f)
 
     try:
-        # استخراج نام و آدرس سرور برای نمایش در لاگ
         config_name = unquote(urlparse(config_url).fragment or 'N/A')
         server_address = outbound_config.get("settings", {}).get("vnext", [{}])[0].get("address") or \
                          outbound_config.get("settings", {}).get("servers", [{}])[0].get("address")
@@ -130,8 +132,7 @@ async def test_config_with_xray(config_url: str) -> bool:
             print(f"[+] موفقیت‌آمیز ({delay.group(1) if delay else 'N/A'} ms)")
             return True
         else:
-            # نمایش خطای دقیق از Xray
-            print(f"[-] ناموفق. خطای Xray: {error_output}")
+            print(f"[-] ناموفق. لاگ Xray: {error_output}")
             return False
             
     except asyncio.TimeoutError:
@@ -139,7 +140,7 @@ async def test_config_with_xray(config_url: str) -> bool:
         return False
     except Exception as e:
         error_output = locals().get('stderr', b'').decode('utf-8').strip()
-        print(f"[-] ناموفق (خطای اجرایی: {e}). خطای Xray: {error_output}")
+        print(f"[-] ناموفق (خطای اجرایی: {e}). لاگ Xray: {error_output}")
         return False
     finally:
         if os.path.exists(temp_filename):
