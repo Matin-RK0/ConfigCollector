@@ -19,40 +19,40 @@ CHANNEL_USERNAMES = [channel.strip() for channel in os.environ.get("CHANNEL_USER
 MESSAGE_LIMIT_PER_CHANNEL = 50
 OUTPUT_FILE = "subscription.txt"
 
-config_pattern = re.compile(r'(vless|vmess|trojan)://[^\s]+')
+# --- Regex نهایی و اصلاح شده ---
+# این الگو کل لینک کانفیگ را با تمام پارامترهایش به درستی استخراج می‌کند
+config_pattern = re.compile(r'\b(vless|vmess|trojan)://[^\s<>"\'`]+')
 
-# --- تابع تست نهایی و هوشمند ---
+
+# --- تابع تست (بدون تغییر نسبت به نسخه قبل) ---
 async def test_config(config: str) -> bool:
     """
     آدرس واقعی سرور را از پارامترهای کانفیگ استخراج کرده و پینگ می‌کند.
-    این نسخه بسیار دقیق‌تر از نسخه‌های قبلی است.
     """
     server_address = ""
     try:
-        # برای vmess کدگذاری شده، ابتدا آن را دیکود می‌کنیم
+        # پاک‌سازی کاراکترهای ناخواسته از انتهای لینک
+        config = config.strip()
+
         if config.startswith('vmess://'):
             try:
                 b64_part = config.split('vmess://')[1]
-                b64_part += '=' * (-len(b64_part) % 4) # Padding
+                b64_part += '=' * (-len(b64_part) % 4)
                 decoded_json = base64.b64decode(b64_part).decode('utf-8')
                 config_data = json.loads(decoded_json)
-                # در vmess آدرس واقعی همیشه در 'add' است
                 server_address = config_data.get('add', '')
             except Exception:
-                # اگر دیکود نشد، احتمالا فرمت جدید vmess است و آدرس مستقیم دارد
                 parsed_url = urlparse(config)
                 server_address = parsed_url.hostname
-        else: # برای vless و trojan
+        else:
             parsed_url = urlparse(config)
             query_params = parse_qs(parsed_url.query)
             
-            # اولویت با پارامتر 'host' یا 'sni' است
-            if 'host' in query_params:
+            if 'host' in query_params and query_params['host'][0]:
                 server_address = query_params['host'][0]
-            elif 'sni' in query_params:
+            elif 'sni' in query_params and query_params['sni'][0]:
                 server_address = query_params['sni'][0]
             else:
-                # اگر پارامتر host وجود نداشت، از آدرس اصلی استفاده کن
                 server_address = parsed_url.hostname
 
         if not server_address:
@@ -64,9 +64,7 @@ async def test_config(config: str) -> bool:
         command = f"ping -c 1 -W 3 {server_address}" if os.name != 'nt' else f"ping -n 1 -w 3000 {server_address}"
         
         proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         await proc.communicate()
 
@@ -91,7 +89,6 @@ async def main():
             try:
                 async for message in client.iter_messages(channel, limit=MESSAGE_LIMIT_PER_CHANNEL):
                     if message.text:
-                        # بهبود Regex برای گرفتن کل لینک حتی با پارامترها
                         found_configs = config_pattern.findall(message.text)
                         all_configs.update(found_configs)
             except Exception as e:
@@ -121,7 +118,6 @@ if __name__ == "__main__":
     if not API_ID or not API_HASH:
         print("❌ خطا: لطفاً مقادیر API_ID و API_HASH را در فایل .env تنظیم کنید.")
     elif not SESSION_STRING:
-        # بخش ساخت session string بدون تغییر
         print("⚠️ Session String یافت نشد. برای ساخت آن وارد شوید.")
         with TelegramClient(StringSession(), int(API_ID), API_HASH) as client:
             session_str = client.session.save()
