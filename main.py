@@ -2,8 +2,9 @@ import os
 import re
 import asyncio
 import base64
-import json  # <-- کتابخانه جدید برای کار با JSON
+import json
 import subprocess
+from urllib.parse import urlparse, parse_qs
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
@@ -18,39 +19,49 @@ CHANNEL_USERNAMES = [channel.strip() for channel in os.environ.get("CHANNEL_USER
 MESSAGE_LIMIT_PER_CHANNEL = 50
 OUTPUT_FILE = "subscription.txt"
 
-config_pattern = re.compile(r'(vless|vmess|trojan)://[a-zA-Z0-9+/=_-]+(?:\?[^\s]+)?(?:#[^\s]+)?')
+config_pattern = re.compile(r'(vless|vmess|trojan)://[^\s]+')
 
-# --- تابع تست بهبود یافته ---
+# --- تابع تست نهایی و هوشمند ---
 async def test_config(config: str) -> bool:
-    """یک کانفیگ را با تست پینگ به سرور آن بررسی می‌کند. (نسخه هوشمندتر)"""
+    """
+    آدرس واقعی سرور را از پارامترهای کانفیگ استخراج کرده و پینگ می‌کند.
+    این نسخه بسیار دقیق‌تر از نسخه‌های قبلی است.
+    """
     server_address = ""
     try:
-        # حالت اول: کانفیگ vmess (معمولاً Base64 است)
+        # برای vmess کدگذاری شده، ابتدا آن را دیکود می‌کنیم
         if config.startswith('vmess://'):
             try:
                 b64_part = config.split('vmess://')[1]
-                # اطمینان از اینکه طول رشته برای base64 معتبر است
-                b64_part += '=' * (-len(b64_part) % 4)
+                b64_part += '=' * (-len(b64_part) % 4) # Padding
                 decoded_json = base64.b64decode(b64_part).decode('utf-8')
                 config_data = json.loads(decoded_json)
+                # در vmess آدرس واقعی همیشه در 'add' است
                 server_address = config_data.get('add', '')
-            except Exception as e:
-                print(f"[!] خطا در کدگشایی vmess: {e}")
-                return False
-
-        # حالت دوم: کانفیگ‌های vless و trojan (آدرس معمولاً مستقیم است)
-        else:
-            match = re.search(r'@([^:]+):', config)
-            if match:
-                server_address = match.group(1)
+            except Exception:
+                # اگر دیکود نشد، احتمالا فرمت جدید vmess است و آدرس مستقیم دارد
+                parsed_url = urlparse(config)
+                server_address = parsed_url.hostname
+        else: # برای vless و trojan
+            parsed_url = urlparse(config)
+            query_params = parse_qs(parsed_url.query)
+            
+            # اولویت با پارامتر 'host' یا 'sni' است
+            if 'host' in query_params:
+                server_address = query_params['host'][0]
+            elif 'sni' in query_params:
+                server_address = query_params['sni'][0]
+            else:
+                # اگر پارامتر host وجود نداشت، از آدرس اصلی استفاده کن
+                server_address = parsed_url.hostname
 
         if not server_address:
-            print(f"[!] آدرس سرور در کانفیگ یافت نشد: {config[:30]}...")
+            print(f"[!] آدرس سرور معتبری در کانفیگ یافت نشد: {config[:40]}...")
             return False
 
-        print(f"[*] تست پینگ: {server_address}...")
+        print(f"[*] تست پینگ آدرس واقعی: {server_address}...")
         
-        command = f"ping -c 1 -W 2 {server_address}" if os.name != 'nt' else f"ping -n 1 -w 2000 {server_address}"
+        command = f"ping -c 1 -W 3 {server_address}" if os.name != 'nt' else f"ping -n 1 -w 3000 {server_address}"
         
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -67,14 +78,12 @@ async def test_config(config: str) -> bool:
             return False
             
     except Exception as e:
-        print(f"[!] خطای کلی در تست کانفیگ: {e}")
+        print(f"[!] خطای کلی در پردازش کانفیگ: {e}")
         return False
 
 # --- تابع اصلی (بدون تغییر) ---
 async def main():
-    """تابع اصلی برای اجرای کل فرآیند."""
     all_configs = set()
-
     async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
         print("✅ کلاینت تلگرام با موفقیت متصل شد.")
         for channel in CHANNEL_USERNAMES:
@@ -82,6 +91,7 @@ async def main():
             try:
                 async for message in client.iter_messages(channel, limit=MESSAGE_LIMIT_PER_CHANNEL):
                     if message.text:
+                        # بهبود Regex برای گرفتن کل لینک حتی با پارامترها
                         found_configs = config_pattern.findall(message.text)
                         all_configs.update(found_configs)
             except Exception as e:
@@ -92,7 +102,6 @@ async def main():
         return
         
     print("\n⏳ شروع تست کانفیگ‌ها...")
-    
     tasks = [test_config(config) for config in all_configs]
     results = await asyncio.gather(*tasks)
     working_configs = [config for config, is_working in zip(all_configs, results) if is_working]
@@ -112,10 +121,11 @@ if __name__ == "__main__":
     if not API_ID or not API_HASH:
         print("❌ خطا: لطفاً مقادیر API_ID و API_HASH را در فایل .env تنظیم کنید.")
     elif not SESSION_STRING:
-        print("⚠️ هشدار: SESSION_STRING یافت نشد. برای ساخت آن، برنامه از شما مشخصات اکانت را خواهد پرسید.")
+        # بخش ساخت session string بدون تغییر
+        print("⚠️ Session String یافت نشد. برای ساخت آن وارد شوید.")
         with TelegramClient(StringSession(), int(API_ID), API_HASH) as client:
             session_str = client.session.save()
-            print("\n✅ Session String شما ایجاد شد. آن را کپی کرده و در فایل .env و GitHub Secrets قرار دهید:")
+            print("\n✅ Session String شما ایجاد شد. آن را کپی کنید:")
             print("-" * 50)
             print(session_str)
             print("-" * 50)
