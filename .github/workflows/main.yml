@@ -3,13 +3,13 @@ name: V2Ray Config Extractor
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/30 * * * *'
+    # این کد یعنی "در دقیقه 0 هر ساعت" (یعنی راس هر ساعت)
+    - cron: '0 * * * *'
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
-    # این بخش جدید، دسترسی لازم برای نوشتن در ریپازیتوری را می‌دهد
     permissions:
       contents: write
 
@@ -23,10 +23,8 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
+        run: pip install -r requirements.txt
+      
       - name: Run the script
         run: python main.py
         env:
@@ -34,6 +32,8 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           SESSION_STRING: ${{ secrets.SESSION_STRING }}
           CHANNEL_USERNAMES: ${{ secrets.CHANNEL_USERNAMES }}
+          # این متغیر جدید برای دسترسی به آدرس ریپازیتوری لازم است
+          GITHUB_REPOSITORY: ${{ github.repository }}
 
       - name: Commit and push if changed
         run: |
@@ -45,5 +45,5 @@ jobs:
             git diff --staged --quiet || git commit -m "Update subscription file"
             git push
           else
-            echo "⚠️ Subscription file not found. No new working configs were found in this run."
+            echo "⚠️ Subscription file not found. No configs were found in this run."
           fi
