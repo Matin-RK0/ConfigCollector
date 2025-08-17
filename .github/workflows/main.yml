@@ -3,7 +3,7 @@ name: V2Ray Config Extractor
 on:
   workflow_dispatch:
   schedule:
-    # این کد یعنی "در دقیقه 0 هر ساعت" (یعنی راس هر ساعت)
+    # اجرا در دقیقه 0 هر ساعت (راس هر ساعت)
     - cron: '0 * * * *'
 
 jobs:
@@ -22,7 +22,20 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      # مرحله جدید: دانلود و آماده‌سازی Xray-core
+      - name: Setup Xray-core
+        run: |
+          echo "Downloading Xray-core..."
+          # دریافت آخرین نسخه Xray برای لینوکس 64 بیتی
+          curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          echo "Unzipping Xray-core..."
+          unzip -q xray.zip xray
+          echo "Making Xray executable..."
+          chmod +x xray
+          # نمایش نسخه برای اطمینان از صحت عملکرد
+          ./xray --version
+
+      - name: Install Python dependencies
         run: pip install -r requirements.txt
       
       - name: Run the script
@@ -32,18 +45,16 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           SESSION_STRING: ${{ secrets.SESSION_STRING }}
           CHANNEL_USERNAMES: ${{ secrets.CHANNEL_USERNAMES }}
-          # این متغیر جدید برای دسترسی به آدرس ریپازیتوری لازم است
           GITHUB_REPOSITORY: ${{ github.repository }}
 
       - name: Commit and push if changed
         run: |
           if [ -f subscription.txt ]; then
-            echo "✅ Subscription file found. Committing changes..."
             git config --global user.name "github-actions[bot]"
             git config --global user.email "github-actions[bot]@users.noreply.github.com"
             git add subscription.txt
             git diff --staged --quiet || git commit -m "Update subscription file"
             git push
           else
-            echo "⚠️ Subscription file not found. No configs were found in this run."
+            echo "⚠️ Subscription file not found or empty. No changes to commit."
           fi
