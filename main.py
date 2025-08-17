@@ -22,7 +22,7 @@ MESSAGE_LIMIT_PER_CHANNEL = 75
 OUTPUT_FILE = "subscription.txt"
 XRAY_PATH = "./xray"
 CONFIG_TEST_TIMEOUT = 10  # مهلت زمانی برای هر تست (ثانیه)
-SOCKS_PORT = 10808 # پورت پروکسی محلی
+MAX_CONCURRENT_TESTS = 10 # تعداد تست‌های همزمان
 
 # Regex برای پیدا کردن کل لینک کانفیگ
 config_pattern = re.compile(r'\b(?:vless|vmess|trojan)://[^\s<>"\'`]+')
@@ -68,14 +68,14 @@ def parse_config_to_xray_json(config_url: str):
         print(f"[!] خطا در پارس کردن کانفیگ: {config_url[:30]}... | خطا: {e}")
         return None
 
-async def test_config_with_xray(config_url: str) -> bool:
-    """یک اتصال واقعی از طریق کانفیگ برقرار کرده و تاخیر آن را اندازه‌گیری می‌کند."""
+async def test_config_with_xray(config_url: str, port: int):
+    """یک اتصال واقعی از طریق کانفیگ روی یک پورت مشخص برقرار کرده و تاخیر آن را اندازه‌گیری می‌کند."""
     outbound_config = parse_config_to_xray_json(config_url)
-    if not outbound_config: return False
+    if not outbound_config: return None
 
     test_config_json = {
         "log": {"loglevel": "warning"},
-        "inbounds": [{"port": SOCKS_PORT, "listen": "127.0.0.1", "protocol": "socks", "settings": {"auth": "noauth", "udp": False}}],
+        "inbounds": [{"port": port, "listen": "127.0.0.1", "protocol": "socks", "settings": {"auth": "noauth", "udp": False}}],
         "outbounds": [outbound_config]
     }
     
@@ -91,28 +91,28 @@ async def test_config_with_xray(config_url: str) -> bool:
             XRAY_PATH, '-c', temp_filename,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        await asyncio.sleep(2) # زمان برای بالا آمدن Xray
+        await asyncio.sleep(2)
 
         if process.returncode is not None:
              error_output = (await process.stderr.read()).decode('utf-8').strip()
              print(f"[-] ناموفق. Xray هنگام اجرا با خطا مواجه شد: {error_output}")
-             return False
+             return None
 
-        connector = ProxyConnector.from_url(f'socks5://127.0.0.1:{SOCKS_PORT}')
+        connector = ProxyConnector.from_url(f'socks5://127.0.0.1:{port}')
         async with aiohttp.ClientSession(connector=connector) as session:
             start_time = asyncio.get_event_loop().time()
             async with session.head("http://www.gstatic.com/generate_204", timeout=CONFIG_TEST_TIMEOUT) as response:
                 end_time = asyncio.get_event_loop().time()
                 if response.status == 204:
                     latency = int((end_time - start_time) * 1000)
-                    print(f"[+] موفقیت‌آمیز ({latency} ms)")
-                    return True
+                    print(f"[+] موفقیت‌آمیز ({latency} ms) - {config_name}")
+                    return config_url
                 else:
-                    print(f"[-] ناموفق (کد وضعیت: {response.status})")
-                    return False
+                    print(f"[-] ناموفق (کد وضعیت: {response.status}) - {config_name}")
+                    return None
     except Exception as e:
-        print(f"[-] ناموفق (خطا: {type(e).__name__})")
-        return False
+        print(f"[-] ناموفق (خطا: {type(e).__name__}) - {config_name}")
+        return None
     finally:
         if process and process.returncode is None:
             process.terminate()
@@ -147,19 +147,25 @@ async def main():
     
     print(f"\n✅ استخراج تمام شد. {len(newly_fetched_configs)} کانفیگ جدید پیدا شد.")
 
-    all_configs_to_test = existing_configs.union(newly_fetched_configs)
+    all_configs_to_test = list(existing_configs.union(newly_fetched_configs))
     print(f"✅ تعداد کل کانفیگ‌ها برای تست (جدید و قدیم): {len(all_configs_to_test)}")
 
     if not all_configs_to_test:
         print("هیچ کانفیگی برای تست وجود ندارد.")
         return
         
-    print("\n⏳ شروع تست اتصال واقعی تمام کانفیگ‌ها...")
-    # اجرای تست‌ها به صورت سریالی برای جلوگیری از تداخل پورت
-    working_configs = []
-    for config in all_configs_to_test:
-        if await test_config_with_xray(config):
-            working_configs.append(config)
+    print("\n⏳ شروع تست اتصال واقعی تمام کانفیگ‌ها به صورت موازی...")
+    
+    # ایجاد وظایف تست به صورت موازی
+    tasks = []
+    base_port = 10810
+    for i, config in enumerate(all_configs_to_test):
+        tasks.append(test_config_with_xray(config, base_port + i))
+
+    results = await asyncio.gather(*tasks)
+    
+    # فیلتر کردن نتایج None (کانفیگ‌های ناموفق)
+    working_configs = [res for res in results if res is not None]
     
     working_configs.sort()
     
