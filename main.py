@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import base64
+import json  # <-- کتابخانه جدید برای کار با JSON
 import subprocess
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
@@ -9,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- تنظیمات اصلی ---
+# --- تنظیمات اصلی (بدون تغییر) ---
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 SESSION_STRING = os.environ.get("SESSION_STRING")
@@ -17,26 +18,40 @@ CHANNEL_USERNAMES = [channel.strip() for channel in os.environ.get("CHANNEL_USER
 MESSAGE_LIMIT_PER_CHANNEL = 50
 OUTPUT_FILE = "subscription.txt"
 
-config_pattern = re.compile(r'(vless|vmess|trojan)://[a-zA-Z0-9+/=_-]+')
+config_pattern = re.compile(r'(vless|vmess|trojan)://[a-zA-Z0-9+/=_-]+(?:\?[^\s]+)?(?:#[^\s]+)?')
 
+# --- تابع تست بهبود یافته ---
 async def test_config(config: str) -> bool:
-    """یک کانفیگ را با تست پینگ به سرور آن بررسی می‌کند."""
+    """یک کانفیگ را با تست پینگ به سرور آن بررسی می‌کند. (نسخه هوشمندتر)"""
+    server_address = ""
     try:
-        server_address = ""
-        # تلاش برای استخراج آدرس سرور از کانفیگ
-        match = re.search(r'@([^:]+):', config)
-        if match:
-            server_address = match.group(1)
+        # حالت اول: کانفیگ vmess (معمولاً Base64 است)
+        if config.startswith('vmess://'):
+            try:
+                b64_part = config.split('vmess://')[1]
+                # اطمینان از اینکه طول رشته برای base64 معتبر است
+                b64_part += '=' * (-len(b64_part) % 4)
+                decoded_json = base64.b64decode(b64_part).decode('utf-8')
+                config_data = json.loads(decoded_json)
+                server_address = config_data.get('add', '')
+            except Exception as e:
+                print(f"[!] خطا در کدگشایی vmess: {e}")
+                return False
+
+        # حالت دوم: کانفیگ‌های vless و trojan (آدرس معمولاً مستقیم است)
+        else:
+            match = re.search(r'@([^:]+):', config)
+            if match:
+                server_address = match.group(1)
 
         if not server_address:
             print(f"[!] آدرس سرور در کانفیگ یافت نشد: {config[:30]}...")
             return False
 
         print(f"[*] تست پینگ: {server_address}...")
-
-        # دستور پینگ بر اساس سیستم‌عامل
+        
         command = f"ping -c 1 -W 2 {server_address}" if os.name != 'nt' else f"ping -n 1 -w 2000 {server_address}"
-
+        
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
@@ -50,10 +65,12 @@ async def test_config(config: str) -> bool:
         else:
             print(f"[-] پینگ ناموفق: {server_address}")
             return False
+            
     except Exception as e:
-        print(f"[!] خطا در تست کانفیگ: {e}")
+        print(f"[!] خطای کلی در تست کانفیگ: {e}")
         return False
 
+# --- تابع اصلی (بدون تغییر) ---
 async def main():
     """تابع اصلی برای اجرای کل فرآیند."""
     all_configs = set()
@@ -71,12 +88,15 @@ async def main():
                 print(f"❌ خطا در خواندن پیام‌های کانال {channel}: {e}")
 
     print(f"\n✅ استخراج تمام شد. تعداد کل کانفیگ‌های پیدا شده: {len(all_configs)}")
+    if not all_configs:
+        return
+        
     print("\n⏳ شروع تست کانفیگ‌ها...")
-
+    
     tasks = [test_config(config) for config in all_configs]
     results = await asyncio.gather(*tasks)
     working_configs = [config for config, is_working in zip(all_configs, results) if is_working]
-
+    
     print(f"\n✅ تست تمام شد. تعداد کانفیگ‌های سالم: {len(working_configs)}")
 
     if working_configs:
