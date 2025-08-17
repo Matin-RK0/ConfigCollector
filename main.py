@@ -21,7 +21,7 @@ GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")
 MESSAGE_LIMIT_PER_CHANNEL = 75
 OUTPUT_FILE = "subscription.txt"
 XRAY_PATH = "./xray"
-CONFIG_TEST_TIMEOUT = 10  # مهلت زمانی برای هر تست (ثانیه)
+CONFIG_TEST_TIMEOUT = 12  # مهلت زمانی برای هر تست (ثانیه)
 MAX_CONCURRENT_TESTS = 10 # تعداد تست‌های همزمان
 
 # Regex برای پیدا کردن کل لینک کانفیگ
@@ -91,7 +91,7 @@ async def test_config_with_xray(config_url: str, port: int):
             XRAY_PATH, '-c', temp_filename,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        await asyncio.sleep(2)
+        await asyncio.sleep(2.5) # افزایش زمان برای بالا آمدن Xray
 
         if process.returncode is not None:
              error_output = (await process.stderr.read()).decode('utf-8').strip()
@@ -106,7 +106,7 @@ async def test_config_with_xray(config_url: str, port: int):
                 if response.status == 204:
                     latency = int((end_time - start_time) * 1000)
                     print(f"[+] موفقیت‌آمیز ({latency} ms) - {config_name}")
-                    return config_url
+                    return (latency, config_url) # برگرداندن تاخیر و کانفیگ
                 else:
                     print(f"[-] ناموفق (کد وضعیت: {response.status}) - {config_name}")
                     return None
@@ -118,6 +118,11 @@ async def test_config_with_xray(config_url: str, port: int):
             process.terminate()
             await process.wait()
         if os.path.exists(temp_filename): os.remove(temp_filename)
+
+async def worker(config, port, semaphore):
+    """یک worker برای اجرای تست با محدودیت همزمانی."""
+    async with semaphore:
+        return await test_config_with_xray(config, port)
 
 async def main():
     existing_configs = set()
@@ -154,20 +159,20 @@ async def main():
         print("هیچ کانفیگی برای تست وجود ندارد.")
         return
         
-    print("\n⏳ شروع تست اتصال واقعی تمام کانفیگ‌ها به صورت موازی...")
+    print(f"\n⏳ شروع تست اتصال واقعی (حداکثر {MAX_CONCURRENT_TESTS} تست همزمان)...")
     
-    # ایجاد وظایف تست به صورت موازی
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
     tasks = []
     base_port = 10810
     for i, config in enumerate(all_configs_to_test):
-        tasks.append(test_config_with_xray(config, base_port + i))
+        tasks.append(worker(config, base_port + i, semaphore))
 
     results = await asyncio.gather(*tasks)
     
-    # فیلتر کردن نتایج None (کانفیگ‌های ناموفق)
-    working_configs = [res for res in results if res is not None]
+    # فیلتر کردن نتایج ناموفق و مرتب‌سازی بر اساس سرعت (تاخیر کمتر)
+    successful_results = sorted([res for res in results if res is not None])
     
-    working_configs.sort()
+    working_configs = [res[1] for res in successful_results] # استخراج لینک کانفیگ‌ها
     
     print(f"\n✅ تست تمام شد. تعداد نهایی کانفیگ‌های سالم: {len(working_configs)}")
 
