@@ -16,8 +16,9 @@ CHANNEL_USERNAMES = [channel.strip() for channel in os.environ.get("CHANNEL_USER
 MESSAGE_LIMIT_PER_CHANNEL = 50
 OUTPUT_FILE = "subscription.txt"
 
-# --- Regex نهایی برای پیدا کردن کل لینک کانفیگ ---
-config_pattern = re.compile(r'\b(vless|vmess|trojan)://[^\s<>"\'`]+')
+# --- Regex نهایی و اصلاح شده ---
+# این نسخه اصلاح شده، گروه capturing را حذف می‌کند تا findall کل لینک را برگرداند
+config_pattern = re.compile(r'\b(?:vless|vmess|trojan)://[^\s<>"\'`]+')
 
 async def main():
     all_configs = set()
