@@ -7,6 +7,8 @@ import subprocess
 import requests
 import uuid
 from urllib.parse import urlparse, parse_qs, unquote
+from telethon.sync import TelegramClient
+from telethon.sessions import StringSession
 
 # --- تنظیمات اولیه ---
 # این بخش‌ها از متغیرهای محیطی خوانده می‌شوند
@@ -30,7 +32,10 @@ def parse_config_to_xray_json(config_url: str):
     """
     try:
         if config_url.startswith("vmess://"):
-            decoded_part = base64.b64decode(config_url[8:]).decode('utf-8')
+            # اطمینان از اینکه طول رشته برای base64 معتبر است
+            b64_part = config_url[8:]
+            b64_part += '=' * (-len(b64_part) % 4)
+            decoded_part = base64.b64decode(b64_part).decode('utf-8')
             vmess_data = json.loads(decoded_part)
             return {
                 "protocol": "vmess",
@@ -75,7 +80,7 @@ def parse_config_to_xray_json(config_url: str):
         # پاک‌سازی مقادیر None
         if config["streamSettings"]["security"] == "none":
             config["streamSettings"]["security"] = ""
-        if not config["streamSettings"]["tlsSettings"]["serverName"]:
+        if "tlsSettings" in config["streamSettings"] and not config["streamSettings"]["tlsSettings"]["serverName"]:
             del config["streamSettings"]["tlsSettings"]
 
         return config
