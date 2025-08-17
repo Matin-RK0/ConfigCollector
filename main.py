@@ -21,58 +21,89 @@ GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")
 MESSAGE_LIMIT_PER_CHANNEL = 75
 OUTPUT_FILE = "subscription.txt"
 XRAY_PATH = "./xray"
-CONFIG_TEST_TIMEOUT = 12  # مهلت زمانی برای هر تست (ثانیه)
-MAX_CONCURRENT_TESTS = 10 # تعداد تست‌های همزمان
+CONFIG_TEST_TIMEOUT = 15  # افزایش مهلت زمانی
+MAX_CONCURRENT_TESTS = 10 
 
 # Regex برای پیدا کردن کل لینک کانفیگ
 config_pattern = re.compile(r'\b(?:vless|vmess|trojan)://[^\s<>"\'`]+')
 
-def parse_config_to_xray_json(config_url: str):
-    """لینک کانفیگ را به فرمت JSON برای Xray تبدیل می‌کند."""
+def parse_config_to_xray_json(uri: str):
+    """
+    لینک کانفیگ را به فرمت JSON قابل فهم برای Xray تبدیل می‌کند.
+    این نسخه بازنویسی شده و بسیار مقاوم‌تر است.
+    """
     try:
-        if config_url.startswith("vmess://"):
-            b64_part = config_url[8:]
-            b64_part += '=' * (-len(b64_part) % 4)
-            vmess_data = json.loads(base64.b64decode(b64_part).decode('utf-8'))
-            return {
+        if uri.startswith("vmess://"):
+            decoded = json.loads(base64.b64decode(uri[8:]).decode())
+            outbound = {
                 "protocol": "vmess",
-                "settings": {"vnext": [{"address": vmess_data.get("add"), "port": int(vmess_data.get("port")), "users": [{"id": vmess_data.get("id"), "alterId": int(vmess_data.get("aid")), "security": vmess_data.get("scy", "auto")}]}]},
-                "streamSettings": {"network": vmess_data.get("net"), "security": vmess_data.get("tls"), "wsSettings": {"path": vmess_data.get("path"), "headers": {"Host": vmess_data.get("host")}} if vmess_data.get("net") == "ws" else None},
-                "tag": "proxy"
+                "settings": {
+                    "vnext": [{
+                        "address": decoded.get("add"),
+                        "port": int(decoded.get("port")),
+                        "users": [{"id": decoded.get("id"), "alterId": int(decoded.get("aid")), "security": decoded.get("scy", "auto")}]
+                    }]
+                },
+                "streamSettings": {
+                    "network": decoded.get("net"),
+                    "security": decoded.get("tls"),
+                    "tlsSettings": {"serverName": decoded.get("sni")} if decoded.get("tls") == "tls" else None,
+                    "wsSettings": {"path": decoded.get("path"), "headers": {"Host": decoded.get("host")}} if decoded.get("net") == "ws" else None,
+                }
             }
+            return outbound
 
-        parsed = urlparse(config_url)
-        params = parse_qs(parsed.query)
-        config = {
-            "protocol": parsed.scheme, "settings": {}, "tag": "proxy",
+        parsed_uri = urlparse(uri)
+        params = parse_qs(parsed_uri.query)
+        
+        outbound = {
+            "protocol": parsed_uri.scheme,
+            "settings": {},
+
             "streamSettings": {
-                "network": params.get("type", [None])[0],
+                "network": params.get("type", ["tcp"])[0],
                 "security": params.get("security", ["none"])[0],
-                "tlsSettings": {"serverName": params.get("sni", [None])[0] or params.get("host", [None])[0]},
-                "wsSettings": {"path": params.get("path", ["/"])[0], "headers": {"Host": params.get("host", [None])[0]}} if params.get("type") == ["ws"] else None,
-                "grpcSettings": {"serviceName": params.get("serviceName", [None])[0]} if params.get("type") == ["grpc"] else None
+                "tlsSettings": {"serverName": params.get("sni", [params.get("host", [None])[0]])[0]},
+                "realitySettings": {"publicKey": params.get("pbk", [None])[0], "shortId": params.get("sid", [None])[0]},
+                "wsSettings": {"path": params.get("path", ["/"])[0], "headers": {"Host": params.get("host", [None])[0]}},
+                "grpcSettings": {"serviceName": params.get("serviceName", [None])[0]},
             }
         }
-        if parsed.scheme in ["vless", "trojan"]:
-            user_info = parsed.username
-            if parsed.scheme == "vless":
-                config["settings"]["vnext"] = [{"address": parsed.hostname, "port": parsed.port, "users": [{"id": user_info, "flow": params.get("flow", [None])[0]}]}]
-            else:
-                config["settings"]["servers"] = [{"address": parsed.hostname, "port": parsed.port, "password": user_info}]
-        
-        if config["streamSettings"]["security"] == "none": config["streamSettings"]["security"] = ""
-        if "tlsSettings" in config["streamSettings"] and not config["streamSettings"]["tlsSettings"]["serverName"]:
-            del config["streamSettings"]["tlsSettings"]
-        return config
+
+        if parsed_uri.scheme == "vless":
+            outbound["settings"]["vnext"] = [{
+                "address": parsed_uri.hostname,
+                "port": parsed_uri.port,
+                "users": [{"id": parsed_uri.username, "flow": params.get("flow", [""])[0], "encryption": params.get("encryption", ["none"])[0]}]
+            }]
+        elif parsed_uri.scheme == "trojan":
+            outbound["settings"]["servers"] = [{
+                "address": parsed_uri.hostname,
+                "port": parsed_uri.port,
+                "password": parsed_uri.username
+            }]
+
+        # --- پاک‌سازی و بهینه‌سازی ---
+        stream_settings = outbound["streamSettings"]
+        if stream_settings["security"] != "tls": del stream_settings["tlsSettings"]
+        if stream_settings["security"] != "reality": del stream_settings["realitySettings"]
+        if stream_settings["network"] != "ws": del stream_settings["wsSettings"]
+        if stream_settings["network"] != "grpc": del stream_settings["grpcSettings"]
+        if stream_settings["security"] == "none": stream_settings["security"] = ""
+
+        return outbound
+
     except Exception as e:
-        print(f"[!] خطا در پارس کردن کانفیگ: {config_url[:30]}... | خطا: {e}")
+        print(f"[!] خطا در پارس کردن کانفیگ: {uri[:40]}... | خطا: {e}")
         return None
+
 
 async def test_config_with_xray(config_url: str, port: int):
     """یک اتصال واقعی از طریق کانفیگ روی یک پورت مشخص برقرار کرده و تاخیر آن را اندازه‌گیری می‌کند."""
     outbound_config = parse_config_to_xray_json(config_url)
     if not outbound_config: return None
-
+    
+    outbound_config["tag"] = "proxy"
     test_config_json = {
         "log": {"loglevel": "warning"},
         "inbounds": [{"port": port, "listen": "127.0.0.1", "protocol": "socks", "settings": {"auth": "noauth", "udp": False}}],
@@ -91,11 +122,13 @@ async def test_config_with_xray(config_url: str, port: int):
             XRAY_PATH, '-c', temp_filename,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        await asyncio.sleep(2.5) # افزایش زمان برای بالا آمدن Xray
+        await asyncio.sleep(3) # افزایش زمان برای بالا آمدن Xray
 
         if process.returncode is not None:
              error_output = (await process.stderr.read()).decode('utf-8').strip()
-             print(f"[-] ناموفق. Xray هنگام اجرا با خطا مواجه شد: {error_output}")
+             print(f"[-] ناموفق. Xray هنگام اجرا با خطا مواجه شد. لاگ: {error_output}")
+             # در صورت خطا، محتوای کانفیگ مشکل‌ساز را چاپ کن
+             # print(f"کانفیگ مشکل‌ساز:\n{json.dumps(test_config_json, indent=2)}")
              return None
 
         connector = ProxyConnector.from_url(f'socks5://127.0.0.1:{port}')
@@ -106,7 +139,7 @@ async def test_config_with_xray(config_url: str, port: int):
                 if response.status == 204:
                     latency = int((end_time - start_time) * 1000)
                     print(f"[+] موفقیت‌آمیز ({latency} ms) - {config_name}")
-                    return (latency, config_url) # برگرداندن تاخیر و کانفیگ
+                    return (latency, config_url)
                 else:
                     print(f"[-] ناموفق (کد وضعیت: {response.status}) - {config_name}")
                     return None
@@ -169,10 +202,9 @@ async def main():
 
     results = await asyncio.gather(*tasks)
     
-    # فیلتر کردن نتایج ناموفق و مرتب‌سازی بر اساس سرعت (تاخیر کمتر)
     successful_results = sorted([res for res in results if res is not None])
     
-    working_configs = [res[1] for res in successful_results] # استخراج لینک کانفیگ‌ها
+    working_configs = [res[1] for res in successful_results]
     
     print(f"\n✅ تست تمام شد. تعداد نهایی کانفیگ‌های سالم: {len(working_configs)}")
 
