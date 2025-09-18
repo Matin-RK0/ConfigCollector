@@ -209,7 +209,7 @@ async def main():
 
     # ----> تغییر اصلی در اینجا اعمال شده است <----
     # 50 کانفیگ برتر (با کمترین تاخیر) را انتخاب می‌کند
-    top_50_configs = successful_results[:50]
+    top_50_configs = successful_results[:100]
     
     # فقط لینک کانفیگ‌ها را استخراج می‌کند
     working_configs = [res[1] for res in top_50_configs]
