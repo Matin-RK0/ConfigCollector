@@ -125,11 +125,11 @@ async def test_config_with_xray(config_url: str, port: int):
         await asyncio.sleep(3) # افزایش زمان برای بالا آمدن Xray
 
         if process.returncode is not None:
-             error_output = (await process.stderr.read()).decode('utf-8').strip()
-             print(f"[-] ناموفق. Xray هنگام اجرا با خطا مواجه شد. لاگ: {error_output}")
-             # در صورت خطا، محتوای کانفیگ مشکل‌ساز را چاپ کن
-             # print(f"کانفیگ مشکل‌ساز:\n{json.dumps(test_config_json, indent=2)}")
-             return None
+              error_output = (await process.stderr.read()).decode('utf-8').strip()
+              print(f"[-] ناموفق. Xray هنگام اجرا با خطا مواجه شد. لاگ: {error_output}")
+              # در صورت خطا، محتوای کانفیگ مشکل‌ساز را چاپ کن
+              # print(f"کانفیگ مشکل‌ساز:\n{json.dumps(test_config_json, indent=2)}")
+              return None
 
         connector = ProxyConnector.from_url(f'socks5://127.0.0.1:{port}')
         async with aiohttp.ClientSession(connector=connector) as session:
@@ -202,17 +202,26 @@ async def main():
 
     results = await asyncio.gather(*tasks)
     
+    # نتایج موفق را فیلتر کرده و بر اساس تاخیر (کم به زیاد) مرتب می‌کند
     successful_results = sorted([res for res in results if res is not None])
     
-    working_configs = [res[1] for res in successful_results]
+    print(f"\n✅ تست تمام شد. {len(successful_results)} کانفیگ سالم پیدا شد.")
+
+    # ----> تغییر اصلی در اینجا اعمال شده است <----
+    # 50 کانفیگ برتر (با کمترین تاخیر) را انتخاب می‌کند
+    top_50_configs = successful_results[:50]
     
-    print(f"\n✅ تست تمام شد. تعداد نهایی کانفیگ‌های سالم: {len(working_configs)}")
+    # فقط لینک کانفیگ‌ها را استخراج می‌کند
+    working_configs = [res[1] for res in top_50_configs]
+    
+    print(f"✅ {len(working_configs)} کانفیگ برتر برای فایل نهایی انتخاب شد.")
+
 
     if working_configs:
         subscription_content = "\n".join(working_configs)
         subscription_base64 = base64.b64encode(subscription_content.encode('utf-8')).decode('utf-8')
         with open(OUTPUT_FILE, "w") as f: f.write(subscription_base64)
-        print(f"\n🚀 لینک سابسکریپشن با موفقیت آپدیت شد.")
+        print(f"\n🚀 لینک سابسکریپشن با موفقیت با {len(working_configs)} کانفیگ آپدیت شد.")
     else:
         with open(OUTPUT_FILE, "w") as f: f.write("")
         print("هیچ کانفیگ سالمی یافت نشد. فایل سابسکریپشن خالی شد.")
