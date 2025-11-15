@@ -174,6 +174,7 @@ async def main():
     newly_fetched_configs = set()
     async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
         print("\n✅ کلاینت تلگرام متصل شد.")
+        
         for channel in CHANNEL_USERNAMES:
             print(f"🔎 در حال بررسی کانال: {channel}")
             try:
