@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # اجرا در دقیقه 0 هر ساعت (راس هر ساعت)
-    - cron: '0 * * * *'
+    - cron: '0 */6 * * *'
 
 jobs:
   build:
