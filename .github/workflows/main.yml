@@ -3,12 +3,16 @@ name: V2Ray Config Extractor
 on:
   workflow_dispatch:
   schedule:
-    # اجرا در دقیقه 0 هر ساعت (راس هر ساعت)
+    # اجرا هر 3 ساعت
     - cron: '0 */3 * * *'
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    concurrency:
+      group: v2ray-config-extractor
+      cancel-in-progress: false
 
     permissions:
       contents: write
@@ -16,30 +20,37 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      # مرحله جدید: دانلود و آماده‌سازی Xray-core
       - name: Setup Xray-core
         run: |
           echo "Downloading Xray-core..."
-          # دریافت آخرین نسخه Xray برای لینوکس 64 بیتی
-          curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+
+          curl -L -o xray.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+
           echo "Unzipping Xray-core..."
           unzip -q xray.zip xray
+
           echo "Making Xray executable..."
           chmod +x xray
-          # نمایش نسخه برای اطمینان از صحت عملکرد
+
+          echo "Xray version:"
           ./xray --version
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
-      
+        run: |
+          pip install -r requirements.txt
+
       - name: Run the script
-        run: python main.py
+        run: |
+          python main.py
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
@@ -49,15 +60,28 @@ jobs:
 
       - name: Commit and push if changed
         run: |
-          if [ -f subscription.txt ]; then
-            git config --global user.name "github-actions[bot]"
-            git config --global user.email "github-actions[bot]@users.noreply.github.com"
-            git add subscription.txt
-            if ! git diff --staged --quiet; then
-              git commit -m "Update subscription file"
-              git pull --rebase origin main
-              git push
-            fi
-          else
-            echo "⚠️ Subscription file not found or empty. No changes to commit."
+          if [ ! -f subscription.txt ]; then
+            echo "⚠️ subscription.txt not found. No changes to commit."
+            exit 0
           fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add subscription.txt
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update subscription file"
+
+          echo "Fetching latest changes from origin/main..."
+          git fetch origin main
+
+          echo "Rebasing local commit onto origin/main..."
+          git rebase origin/main
+
+          echo "Pushing changes..."
+          git push origin HEAD:main
