@@ -3,8 +3,8 @@ name: V2Ray Config Extractor
 on:
   workflow_dispatch:
   schedule:
-    # اجرا هر 3 ساعت
-    - cron: '0 */3 * * *'
+    # اجرا هر 6 ساعت
+    - cron: '0 */6 * * *'
 
 jobs:
   build:
@@ -43,6 +43,11 @@ jobs:
 
           echo "Xray version:"
           ./xray --version
+
+      - name: Install Tesseract OCR (برای خواندن کانفیگ داخل تصاویر)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
 
       - name: Install Python dependencies
         run: |

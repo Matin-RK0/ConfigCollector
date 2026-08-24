@@ -1,5 +1,7 @@
 import os
 import re
+import io
+import shutil
 import asyncio
 import base64
 import json
@@ -22,10 +24,201 @@ MESSAGE_LIMIT_PER_CHANNEL = 75
 OUTPUT_FILE = "subscription.txt"
 XRAY_PATH = "./xray"
 CONFIG_TEST_TIMEOUT = 15  # افزایش مهلت زمانی
-MAX_CONCURRENT_TESTS = 10 
+MAX_CONCURRENT_TESTS = 10
+MAX_CONFIGS_IN_SUBSCRIPTION = 100  # حداکثر تعداد کانفیگ فایل نهایی
+MAX_MEDIA_FILE_SIZE = 8 * 1024 * 1024  # حداکثر حجم فایل ضمیمه برای بررسی (۸ مگابایت)
+TESSERACT_BIN = shutil.which("tesseract")  # برای خواندن کانفیگ داخل عکس (اختیاری)
 
-# Regex برای پیدا کردن کل لینک کانفیگ
-config_pattern = re.compile(r'\b(?:vless|vmess|trojan)://[^\s<>"\'`]+')
+# --- الگوهای استخراج ---
+# Regex برای پیدا کردن لینک کانفیگ از همه پروتکل‌های رایج
+config_pattern = re.compile(
+    r'\b(?:vless|vmess|trojan|ssr|ss|hysteria2|hysteria|hy2|tuic|juicity|naive\+https?|wireguard)'
+    r'://[^\s<>"\'`\u200b-\u200f\u202a-\u202e\u2060\ufeff]+'
+)
+
+# پروتکل‌هایی که هسته Xray پشتیبانی می‌کند و قابل تست هستند
+XRAY_SUPPORTED_SCHEMES = {"vless", "vmess", "trojan", "ss"}
+
+# کاراکترهای نامرئی که کانال‌ها برای دور زدن فیلتر داخل متن می‌گذارند
+invisible_chars_re = re.compile(r'[\u200b\u200c\u200d\u200e\u200f\u202a-\u202e\u2060\ufeff]')
+
+# بلوک‌های بزرگ Base64 (مثلاً سابسکریپشن کامل که انکود شده داخل متن پست می‌شود)
+base64_blob_pattern = re.compile(r'[A-Za-z0-9+/\-_]{24,}={0,2}')
+
+# علائم نگارشی انتهای لینک که باید پاک شوند (مثل «vless://....» یا «vless://...,»)
+TRAILING_JUNK = ".,;:!?)\\]}>'\"`»«…|*\\"
+
+# فرمت‌های فایل ضمیمه که متنی هستند و قابل اسکن
+TEXT_MIME_PREFIXES = ("text/", "application/json", "application/yaml", "application/x-yaml")
+TEXT_FILE_EXTS = (".txt", ".conf", ".cfg", ".ini", ".yaml", ".yml", ".json", ".log", ".list", ".sub")
+
+_ocr_unavailable_warned = False
+
+
+def get_config_scheme(uri: str) -> str:
+    return uri.split("://", 1)[0].lower()
+
+
+def b64_decode_padded(data: str):
+    """دیکود Base64 با اصلاح خودکار padding و پشتیبانی از URL-safe."""
+    data = ''.join(data.split()).replace('-', '+').replace('_', '/')
+    if len(data) % 4:
+        data += '=' * (4 - len(data) % 4)
+    return base64.b64decode(data)
+
+
+def clean_config_link(candidate: str) -> str:
+    """کاراکترهای مخفی و علائم نگارشی اضافه انتهای لینک را حذف می‌کند."""
+    link = invisible_chars_re.sub('', candidate).strip()
+    while link and link[-1] in TRAILING_JUNK:
+        link = link[:-1].rstrip()
+    return link
+
+
+def try_decode_base64_text(chunk: str):
+    """یک بلوک Base64 را دیکود می‌کند؛ فقط اگر خروجی متنی خوانا باشد برگردانده می‌شود."""
+    try:
+        decoded = b64_decode_padded(chunk).decode('utf-8')
+    except Exception:
+        return None
+    if not decoded:
+        return None
+    printable = sum(1 for ch in decoded if ch.isprintable() or ch in '\r\n\t')
+    if printable / len(decoded) < 0.95:
+        return None
+    return decoded
+
+
+def extract_configs_from_text(raw_text, sink: set):
+    """
+    متن پیام را از سه حالت استخراج می‌کند:
+    ۱) متن معمولی  ۲) لینکی که وسطش اینتر/خط جدید خورده  ۳) بلوک‌های Base64 انکود شده
+    """
+    if not raw_text:
+        return
+    text = invisible_chars_re.sub('', raw_text)
+
+    sources = [
+        text,
+        text.replace('\r', '').replace('\n', ''),  # چسباندن خطوط برای لینک‌های چندخطی
+    ]
+    for blob in base64_blob_pattern.findall(text):
+        decoded = try_decode_base64_text(blob)
+        if decoded and '://' in decoded:
+            sources.append(decoded)
+
+    for source in sources:
+        for match in config_pattern.findall(source):
+            link = clean_config_link(match)
+            if len(link) > 10:
+                sink.add(link)
+
+
+def extract_configs_from_buttons(message, sink: set):
+    """کانفیگ‌هایی که داخل دکمه‌های شیشه‌ای (Inline/Reply Keyboard) قرار دارند را استخراج می‌کند."""
+    markup = getattr(message, 'reply_markup', None)
+    if not markup:
+        return
+    rows = getattr(markup, 'rows', None)
+    if not rows:
+        return
+    for row in rows:
+        for button in getattr(row, 'buttons', None) or []:
+            for value in (getattr(button, 'url', None),
+                          getattr(button, 'text', None),
+                          getattr(button, 'query', None)):
+                if value and '://' in str(value):
+                    extract_configs_from_text(str(value), sink)
+
+
+async def extract_configs_from_image(image_bytes: bytes, sink: set):
+    """با OCR متن داخل تصویر (اسکرین‌شات کانفیگ) را می‌خواند؛ در نبود Tesseract رد می‌شود."""
+    global _ocr_unavailable_warned
+    if not TESSERACT_BIN:
+        if not _ocr_unavailable_warned:
+            print("⚠️ Tesseract نصب نیست؛ تصاویر بررسی نشدند (برای OCR آن را نصب کنید).")
+            _ocr_unavailable_warned = True
+        return
+    try:
+        from PIL import Image
+        import pytesseract
+    except ImportError:
+        if not _ocr_unavailable_warned:
+            print("⚠️ کتابخانه‌های Pillow/pytesseract نصب نیستند؛ تصاویر بررسی نشدند.")
+            _ocr_unavailable_warned = True
+        return
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, pytesseract.image_to_string, image)
+        extract_configs_from_text(text, sink)
+    except Exception as e:
+        print(f"[!] خطا در OCR تصویر: {e}")
+
+
+async def extract_configs_from_media(message, sink: set):
+    """فایل‌های ضمیمه متنی (.txt و مشابه) و تصاویر (با OCR) را بررسی می‌کند."""
+    document = message.document
+    if document and (document.size or 0) <= MAX_MEDIA_FILE_SIZE:
+        mime = document.mime_type or ""
+        filename = ""
+        for attr in document.attributes:
+            filename = getattr(attr, 'file_name', '') or filename
+        lower_name = filename.lower()
+
+        if mime.startswith('image/'):
+            data = await message.download_media(file=bytes)
+            if data:
+                await extract_configs_from_image(data, sink)
+        elif any(mime.startswith(p) for p in TEXT_MIME_PREFIXES) or lower_name.endswith(TEXT_FILE_EXTS):
+            data = await message.download_media(file=bytes)
+            if data:
+                extract_configs_from_text(data.decode('utf-8', errors='ignore'), sink)
+                print(f"[*] فایل ضمیمه '{filename or 'بدون‌نام'}' اسکن شد.")
+    elif message.photo:
+        data = await message.download_media(file=bytes)
+        if data:
+            await extract_configs_from_image(data, sink)
+
+
+def parse_ss_uri(uri: str):
+    """لینک Shadowsocks را (هم فرمت legacy کاملاً انکود شده و هم SIP002) پارس می‌کند."""
+    try:
+        main_part = uri[5:].split('#', 1)[0]
+        main_part = main_part.split('?', 1)[0]
+
+        if '@' in main_part:
+            userinfo, hostport = main_part.rsplit('@', 1)
+            userinfo = unquote(userinfo)
+            if ':' not in userinfo:
+                decoded = try_decode_base64_text(userinfo) or ''
+                if ':' not in decoded:
+                    return None
+                userinfo = decoded
+        else:
+            decoded = b64_decode_padded(main_part).decode('utf-8', errors='ignore')
+            if '@' not in decoded:
+                return None
+            userinfo, hostport = decoded.rsplit('@', 1)
+
+        method, password = userinfo.split(':', 1)
+        host, port = hostport.rsplit(':', 1)
+        return {
+            "protocol": "shadowsocks",
+            "settings": {
+                "servers": [{
+                    "address": host.strip('[]'),
+                    "port": int(port),
+                    "method": method,
+                    "password": password
+                }]
+            },
+            "streamSettings": {"network": "tcp", "security": ""}
+        }
+    except Exception as e:
+        print(f"[!] خطا در پارس کردن کانفیگ: {uri[:40]}... | خطا: {e}")
+        return None
+
 
 def parse_config_to_xray_json(uri: str):
     """
@@ -34,7 +227,7 @@ def parse_config_to_xray_json(uri: str):
     """
     try:
         if uri.startswith("vmess://"):
-            decoded = json.loads(base64.b64decode(uri[8:]).decode())
+            decoded = json.loads(b64_decode_padded(uri[8:]).decode())
             outbound = {
                 "protocol": "vmess",
                 "settings": {
@@ -52,6 +245,9 @@ def parse_config_to_xray_json(uri: str):
                 }
             }
             return outbound
+
+        if uri.startswith("ss://"):
+            return parse_ss_uri(uri)
 
         parsed_uri = urlparse(uri)
         params = parse_qs(parsed_uri.query)
@@ -127,8 +323,6 @@ async def test_config_with_xray(config_url: str, port: int):
         if process.returncode is not None:
               error_output = (await process.stderr.read()).decode('utf-8').strip()
               print(f"[-] ناموفق. Xray هنگام اجرا با خطا مواجه شد. لاگ: {error_output}")
-              # در صورت خطا، محتوای کانفیگ مشکل‌ساز را چاپ کن
-              # print(f"کانفیگ مشکل‌ساز:\n{json.dumps(test_config_json, indent=2)}")
               return None
 
         connector = ProxyConnector.from_url(f'socks5://127.0.0.1:{port}')
@@ -179,50 +373,56 @@ async def main():
             print(f"🔎 در حال بررسی کانال: {channel}")
             try:
                 async for message in client.iter_messages(channel, limit=MESSAGE_LIMIT_PER_CHANNEL):
-                    if message.text:
-                        newly_fetched_configs.update(config.strip() for config in config_pattern.findall(message.text))
+                    # ۱) متن پیام یا کپشن مدیا (متن ساده، لینک چندخطی و بلوک Base64)
+                    extract_configs_from_text(message.text, newly_fetched_configs)
+                    # ۲) دکمه‌های شیشه‌ای زیر پیام
+                    extract_configs_from_buttons(message, newly_fetched_configs)
+                    # ۳) فایل ضمیمه متنی یا تصویر (با OCR)
+                    await extract_configs_from_media(message, newly_fetched_configs)
             except Exception as e:
                 print(f"❌ خطا در خواندن کانال {channel}: {e}")
     
-    print(f"\n✅ استخراج تمام شد. {len(newly_fetched_configs)} کانفیگ جدید پیدا شد.")
+    # جدا کردن کانفیگ‌ها: آن‌ها که Xray می‌تواند تست کند و آن‌ها که خارج از توان Xray هستند
+    all_found_configs = existing_configs.union(newly_fetched_configs)
+    testable_configs = sorted(c for c in all_found_configs if get_config_scheme(c) in XRAY_SUPPORTED_SCHEMES)
+    untestable_configs = sorted(c for c in all_found_configs if get_config_scheme(c) not in XRAY_SUPPORTED_SCHEMES)
 
-    all_configs_to_test = list(existing_configs.union(newly_fetched_configs))
-    print(f"✅ تعداد کل کانفیگ‌ها برای تست (جدید و قدیم): {len(all_configs_to_test)}")
+    print(f"\n✅ استخراج تمام شد. مجموعاً {len(all_found_configs)} کانفیگ پیدا شد.")
+    print(f"   ↳ {len(testable_configs)} عدد قابل تست با Xray | {len(untestable_configs)} عدد خارج از توان Xray (بدون تست اضافه می‌شوند)")
 
-    if not all_configs_to_test:
+    if not all_found_configs:
         print("هیچ کانفیگی برای تست وجود ندارد.")
         return
+
+    successful_results = []
+    if testable_configs:
+        print(f"\n⏳ شروع تست اتصال واقعی (حداکثر {MAX_CONCURRENT_TESTS} تست همزمان)...")
         
-    print(f"\n⏳ شروع تست اتصال واقعی (حداکثر {MAX_CONCURRENT_TESTS} تست همزمان)...")
-    
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
-    tasks = []
-    base_port = 10810
-    for i, config in enumerate(all_configs_to_test):
-        tasks.append(worker(config, base_port + i, semaphore))
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
+        tasks = []
+        base_port = 10810
+        for i, config in enumerate(testable_configs):
+            tasks.append(worker(config, base_port + i, semaphore))
 
-    results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
+        
+        # نتایج موفق را فیلتر کرده و بر اساس تاخیر (کم به زیاد) مرتب می‌کند
+        successful_results = sorted([res for res in results if res is not None])
+        
+        print(f"\n✅ تست تمام شد. {len(successful_results)} کانفیگ سالم پیدا شد.")
     
-    # نتایج موفق را فیلتر کرده و بر اساس تاخیر (کم به زیاد) مرتب می‌کند
-    successful_results = sorted([res for res in results if res is not None])
+    # کانفیگ‌های تست‌شده و سالم (مرتب بر اساس تاخیر) + کانفیگ‌های غیرقابل تست (hysteria، tuic و...)
+    merged_configs = list(dict.fromkeys([res[1] for res in successful_results] + untestable_configs))
+    final_configs = merged_configs[:MAX_CONFIGS_IN_SUBSCRIPTION]
     
-    print(f"\n✅ تست تمام شد. {len(successful_results)} کانفیگ سالم پیدا شد.")
-
-    # ----> تغییر اصلی در اینجا اعمال شده است <----
-    # 50 کانفیگ برتر (با کمترین تاخیر) را انتخاب می‌کند
-    top_50_configs = successful_results[:100]
-    
-    # فقط لینک کانفیگ‌ها را استخراج می‌کند
-    working_configs = [res[1] for res in top_50_configs]
-    
-    print(f"✅ {len(working_configs)} کانفیگ برتر برای فایل نهایی انتخاب شد.")
+    print(f"✅ {len(final_configs)} کانفیگ برای فایل نهایی انتخاب شد.")
 
 
-    if working_configs:
-        subscription_content = "\n".join(working_configs)
+    if final_configs:
+        subscription_content = "\n".join(final_configs)
         subscription_base64 = base64.b64encode(subscription_content.encode('utf-8')).decode('utf-8')
         with open(OUTPUT_FILE, "w") as f: f.write(subscription_base64)
-        print(f"\n🚀 لینک سابسکریپشن با موفقیت با {len(working_configs)} کانفیگ آپدیت شد.")
+        print(f"\n🚀 لینک سابسکریپشن با موفقیت با {len(final_configs)} کانفیگ آپدیت شد.")
     else:
         with open(OUTPUT_FILE, "w") as f: f.write("")
         print("هیچ کانفیگ سالمی یافت نشد. فایل سابسکریپشن خالی شد.")
