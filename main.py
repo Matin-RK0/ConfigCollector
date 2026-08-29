@@ -52,14 +52,14 @@ DEFAULT_SOURCE_URLS = [
 ]
 
 # --- الگوهای استخراج ---
-# Regex برای پیدا کردن لینک کانفیگ از همه پروتکل‌های رایج
+# Regex برای استخراج فقط پروتکل‌های مجاز پروژه
 config_pattern = re.compile(
-    r'\b(?:vless|vmess|trojan|ssr|ss|hysteria2|hysteria|hy2|tuic|juicity|naive\+https?|wireguard)'
+    r'\b(?:vless|vmess)'
     r'://[^\s<>"\'`\u200b-\u200f\u202a-\u202e\u2060\ufeff]+'
 )
 
-# پروتکل‌هایی که هسته Xray پشتیبانی می‌کند و قابل تست هستند
-XRAY_SUPPORTED_SCHEMES = {"vless", "vmess", "trojan", "ss"}
+# پروتکل‌های مجاز برای تست و هر دو خروجی سابسکریپشن
+XRAY_SUPPORTED_SCHEMES = {"vless", "vmess"}
 
 # کاراکترهای نامرئی که کانال‌ها برای دور زدن فیلتر داخل متن می‌گذارند
 invisible_chars_re = re.compile(r'[\u200b\u200c\u200d\u200e\u200f\u202a-\u202e\u2060\ufeff]')
@@ -455,6 +455,18 @@ async def worker(config, port, semaphore):
     async with semaphore:
         return await test_config_with_xray(config, port)
 
+
+async def test_config_batch(configs):
+    """کانفیگ‌های یکتا را یک‌بار تست می‌کند و نتایج موفق را بر اساس latency مرتب می‌کند."""
+    configs = list(configs)
+    if not configs:
+        return []
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
+    tasks = [worker(config, 10810 + i, semaphore) for i, config in enumerate(configs)]
+    results = await asyncio.gather(*tasks)
+    return sorted(res for res in results if res is not None)
+
+
 async def main():
     existing_configs = set()
     if GITHUB_REPOSITORY:
@@ -489,17 +501,26 @@ async def main():
             except Exception as e:
                 print(f"❌ خطا در خواندن کانال {channel}: {e}")
     
-    # جدا کردن کانفیگ‌ها: آن‌ها که Xray می‌تواند تست کند و آن‌ها که خارج از توان Xray هستند
+    # دو مجموعه عمداً جدا هستند: منابع عمومی برای Top-100 و تلگرام برای ساب فعلی.
     external_configs = set().union(*external_source_sets) if external_source_sets else set()
-    all_found_configs = existing_configs.union(newly_fetched_configs).union(external_configs)
-    source_sets = external_source_sets + [newly_fetched_configs, existing_configs]
-    candidate_configs = select_candidate_configs(source_sets, MAX_SOURCE_CANDIDATES)
-    candidate_set = set(candidate_configs)
-    testable_configs = sorted(c for c in candidate_set if get_config_scheme(c) in XRAY_SUPPORTED_SCHEMES)
-    untestable_configs = sorted(c for c in candidate_set if get_config_scheme(c) not in XRAY_SUPPORTED_SCHEMES)
+    legacy_configs = existing_configs.union(newly_fetched_configs)
+    all_found_configs = legacy_configs.union(external_configs)
 
-    print(f"\n✅ استخراج تمام شد. مجموعاً {len(all_found_configs)} کانفیگ پیدا شد؛ {len(candidate_configs)} کاندید برای تست انتخاب شد.")
-    print(f"   ↳ {len(testable_configs)} عدد قابل تست با Xray | {len(untestable_configs)} عدد خارج از توان Xray (بدون تست اضافه می‌شوند)")
+    # ساب فعلی: فقط سابقه و کانال‌های تلگرام (با همان سقف تست برای کنترل زمان).
+    legacy_candidates = select_candidate_configs([newly_fetched_configs, existing_configs], MAX_SOURCE_CANDIDATES)
+    legacy_candidate_set = set(legacy_candidates)
+    legacy_testable = {c for c in legacy_candidate_set if get_config_scheme(c) in XRAY_SUPPORTED_SCHEMES}
+    # طبق تنظیم فعلی، هیچ پروتکل تست‌نشده‌ای به ساب فعلی اضافه نمی‌شود.
+    legacy_untestable = []
+
+    # Top-100: فقط منابع URL عمومی.
+    top_candidates = select_candidate_configs(external_source_sets, MAX_SOURCE_CANDIDATES)
+    top_candidate_set = set(top_candidates)
+    top_testable = {c for c in top_candidate_set if get_config_scheme(c) in XRAY_SUPPORTED_SCHEMES}
+    testable_configs = sorted(legacy_testable.union(top_testable))
+
+    print(f"\n✅ استخراج تمام شد. تلگرام/سابقه: {len(legacy_configs)} | منابع URL: {len(external_configs)}")
+    print(f"   ↳ فقط VLESS/VMess | کاندید تست ساب فعلی: {len(legacy_candidates)} | کاندید Top-100: {len(top_candidates)} | تست یکتا: {len(testable_configs)}")
 
     if not all_found_configs:
         print("هیچ کانفیگی برای تست وجود ندارد.")
@@ -508,22 +529,15 @@ async def main():
     successful_results = []
     if testable_configs:
         print(f"\n⏳ شروع تست اتصال واقعی (حداکثر {MAX_CONCURRENT_TESTS} تست همزمان)...")
-        
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_TESTS)
-        tasks = []
-        base_port = 10810
-        for i, config in enumerate(testable_configs):
-            tasks.append(worker(config, base_port + i, semaphore))
-
-        results = await asyncio.gather(*tasks)
-        
-        # نتایج موفق را فیلتر کرده و بر اساس تاخیر (کم به زیاد) مرتب می‌کند
-        successful_results = sorted([res for res in results if res is not None])
+        successful_results = await test_config_batch(testable_configs)
         
         print(f"\n✅ تست تمام شد. {len(successful_results)} کانفیگ سالم پیدا شد.")
+
+    legacy_successful_results = sorted(res for res in successful_results if res[1] in legacy_testable)
+    top_successful_results = sorted(res for res in successful_results if res[1] in top_testable)
     
-    # کانفیگ‌های تست‌شده و سالم (مرتب بر اساس تاخیر) + کانفیگ‌های غیرقابل تست (hysteria، tuic و...)
-    merged_configs = list(dict.fromkeys([res[1] for res in successful_results] + untestable_configs))
+    # ساب فعلی فقط از نتایج تلگرام/سابقه ساخته می‌شود.
+    merged_configs = list(dict.fromkeys([res[1] for res in legacy_successful_results] + legacy_untestable))
     final_configs = merged_configs[:MAX_CONFIGS_IN_SUBSCRIPTION]
     
     print(f"✅ {len(final_configs)} کانفیگ برای فایل نهایی انتخاب شد.")
@@ -539,7 +553,7 @@ async def main():
         print("هیچ کانفیگ سالمی یافت نشد. فایل سابسکریپشن خالی شد.")
 
     # خروجی مستقل Top-100: فقط کانفیگ‌هایی که تست واقعی موفق داشته‌اند.
-    top_configs = [res[1] for res in successful_results[:TOP_CONFIGS]]
+    top_configs = [res[1] for res in top_successful_results[:TOP_CONFIGS]]
     if top_configs:
         top_content = "\n".join(top_configs)
         top_encoded = base64.b64encode(top_content.encode("utf-8")).decode("ascii")

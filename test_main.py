@@ -36,6 +36,9 @@ class ConfigCollectorHelpersTest(unittest.TestCase):
         self.assertEqual(len(selected), 1000)
         self.assertEqual(len(set(selected)), 1000)
 
+    def test_only_vless_and_vmess_are_testable(self):
+        self.assertEqual(self.main.XRAY_SUPPORTED_SCHEMES, {"vless", "vmess"})
+
 
 if __name__ == "__main__":
     unittest.main()
