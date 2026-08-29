@@ -8,11 +8,22 @@ import json
 import subprocess
 import requests
 import uuid
+import hashlib
 from urllib.parse import urlparse, parse_qs, unquote
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 import aiohttp
 from aiohttp_socks import ProxyConnector
+
+
+def env_int(name, default):
+    value = os.environ.get(name, "").strip()
+    try:
+        return int(value) if value else default
+    except ValueError:
+        print(f"⚠️ مقدار {name} نامعتبر است؛ مقدار پیش‌فرض {default} استفاده می‌شود.")
+        return default
+
 
 # --- تنظیمات اولیه ---
 API_ID = os.environ.get("API_ID")
@@ -22,12 +33,23 @@ CHANNEL_USERNAMES = [channel.strip() for channel in os.environ.get("CHANNEL_USER
 GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY")
 MESSAGE_LIMIT_PER_CHANNEL = 75
 OUTPUT_FILE = "subscription.txt"
+TOP_OUTPUT_FILE = "subscription_top100.txt"
 XRAY_PATH = "./xray"
-CONFIG_TEST_TIMEOUT = 15  # افزایش مهلت زمانی
-MAX_CONCURRENT_TESTS = 10
+CONFIG_TEST_TIMEOUT = env_int("CONFIG_TEST_TIMEOUT", 10)
+MAX_CONCURRENT_TESTS = env_int("MAX_CONCURRENT_TESTS", 20)
 MAX_CONFIGS_IN_SUBSCRIPTION = 100  # حداکثر تعداد کانفیگ فایل نهایی
+TOP_CONFIGS = env_int("TOP_CONFIGS", 100)
+MAX_SOURCE_CANDIDATES = env_int("MAX_SOURCE_CANDIDATES", 1000)
+SOURCE_FETCH_TIMEOUT = env_int("SOURCE_FETCH_TIMEOUT", 20)
+MAX_SOURCE_RESPONSE_BYTES = env_int("MAX_SOURCE_RESPONSE_BYTES", 20 * 1024 * 1024)
 MAX_MEDIA_FILE_SIZE = 8 * 1024 * 1024  # حداکثر حجم فایل ضمیمه برای بررسی (۸ مگابایت)
 TESSERACT_BIN = shutil.which("tesseract")  # برای خواندن کانفیگ داخل عکس (اختیاری)
+
+DEFAULT_SOURCE_URLS = [
+    "https://raw.githubusercontent.com/morpheusadam/v2ray-config/main/subs/bundles/iran.txt",
+    "https://raw.githubusercontent.com/Bllare/V2ray-Configs/main/ALL.txt",
+    "https://raw.githubusercontent.com/miladtahanian/Config-Collector/main/mixed_iran.txt",
+]
 
 # --- الگوهای استخراج ---
 # Regex برای پیدا کردن لینک کانفیگ از همه پروتکل‌های رایج
@@ -73,6 +95,88 @@ def clean_config_link(candidate: str) -> str:
     while link and link[-1] in TRAILING_JUNK:
         link = link[:-1].rstrip()
     return link
+
+
+def configured_source_urls():
+    """منابع را از Env می‌خواند؛ در نبود آن از فهرست پیش‌فرض استفاده می‌کند."""
+    raw = os.environ.get("SOURCE_SUBSCRIPTION_URLS", "")
+    values = re.split(r"[,\n]+", raw) if raw.strip() else DEFAULT_SOURCE_URLS
+    return list(dict.fromkeys(v.strip() for v in values if v.strip()))
+
+
+def source_mirrors(url: str):
+    """برای raw.githubusercontent.com آینه jsDelivr می‌سازد."""
+    mirrors = []
+    match = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(.+)$", url)
+    if match:
+        owner, repo, path = match.groups()
+        mirrors.append(f"https://cdn.jsdelivr.net/gh/{owner}/{repo}@{path.split('/', 1)[0]}/{path.split('/', 1)[1] if '/' in path else ''}".rstrip('/'))
+    return mirrors
+
+
+def extract_configs_from_source_text(raw_text: str) -> set:
+    """متن منبع را به‌صورت مستقیم و در صورت نیاز به‌صورت Base64 بررسی می‌کند."""
+    found = set()
+    extract_configs_from_text(raw_text, found)
+    if not found and raw_text:
+        decoded = try_decode_base64_text(raw_text)
+        if decoded:
+            extract_configs_from_text(decoded, found)
+    return found
+
+
+async def fetch_source(session, url: str):
+    """یک منبع را با سقف حجم و یک تلاش آینه‌ای واکشی می‌کند."""
+    urls = [url] + source_mirrors(url)
+    timeout = aiohttp.ClientTimeout(total=SOURCE_FETCH_TIMEOUT)
+    last_error = None
+    for attempt_url in urls:
+        try:
+            async with session.get(attempt_url, timeout=timeout, headers={"User-Agent": "ConfigCollector/1.0"}) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"HTTP {response.status}")
+                chunks, size = [], 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    size += len(chunk)
+                    if size > MAX_SOURCE_RESPONSE_BYTES:
+                        raise RuntimeError("response exceeds size limit")
+                    chunks.append(chunk)
+                text = b"".join(chunks).decode("utf-8", errors="ignore")
+                return extract_configs_from_source_text(text)
+        except Exception as exc:
+            last_error = exc
+    print(f"⚠️ منبع در دسترس نبود ({url}): {last_error}")
+    return set()
+
+
+async def fetch_external_sources(urls):
+    """تمام منابع را همزمان می‌خواند و مجموعهٔ جداگانهٔ هر منبع را برمی‌گرداند."""
+    connector = aiohttp.TCPConnector(limit=min(len(urls), 10))
+    async with aiohttp.ClientSession(connector=connector) as session:
+        results = await asyncio.gather(*(fetch_source(session, url) for url in urls))
+    for url, configs in zip(urls, results):
+        print(f"🌐 منبع {url}: {len(configs)} کانفیگ استخراج شد.")
+    return results
+
+
+def select_candidate_configs(source_sets, limit: int):
+    """تا سقف limit کاندید را به‌صورت قطعی و متوازن بین منابع انتخاب می‌کند."""
+    sets = [set(s) for s in source_sets if s]
+    if not sets or limit <= 0:
+        return []
+    ordered = [sorted(s, key=lambda value: hashlib.sha256(value.encode()).hexdigest()) for s in sets]
+    selected, seen = [], set()
+    quota = max(1, limit // len(ordered))
+    for values in ordered:
+        for value in values[:quota]:
+            if value not in seen:
+                selected.append(value); seen.add(value)
+    remainder = []
+    for values in ordered:
+        remainder.extend(v for v in values[quota:] if v not in seen)
+    remainder.sort(key=lambda value: hashlib.sha256(value.encode()).hexdigest())
+    selected.extend(remainder[:max(0, limit - len(selected))])
+    return selected[:limit]
 
 
 def try_decode_base64_text(chunk: str):
@@ -318,7 +422,7 @@ async def test_config_with_xray(config_url: str, port: int):
             XRAY_PATH, '-c', temp_filename,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        await asyncio.sleep(3) # افزایش زمان برای بالا آمدن Xray
+        await asyncio.sleep(1)
 
         if process.returncode is not None:
               error_output = (await process.stderr.read()).decode('utf-8').strip()
@@ -366,6 +470,9 @@ async def main():
             print(f"⚠️ خواندن کانفیگ‌های قبلی ممکن نبود: {e}")
 
     newly_fetched_configs = set()
+    source_urls = configured_source_urls()
+    print(f"\n🔗 شروع واکشی {len(source_urls)} منبع عمومی...")
+    external_source_sets = await fetch_external_sources(source_urls)
     async with TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH) as client:
         print("\n✅ کلاینت تلگرام متصل شد.")
         
@@ -383,11 +490,15 @@ async def main():
                 print(f"❌ خطا در خواندن کانال {channel}: {e}")
     
     # جدا کردن کانفیگ‌ها: آن‌ها که Xray می‌تواند تست کند و آن‌ها که خارج از توان Xray هستند
-    all_found_configs = existing_configs.union(newly_fetched_configs)
-    testable_configs = sorted(c for c in all_found_configs if get_config_scheme(c) in XRAY_SUPPORTED_SCHEMES)
-    untestable_configs = sorted(c for c in all_found_configs if get_config_scheme(c) not in XRAY_SUPPORTED_SCHEMES)
+    external_configs = set().union(*external_source_sets) if external_source_sets else set()
+    all_found_configs = existing_configs.union(newly_fetched_configs).union(external_configs)
+    source_sets = external_source_sets + [newly_fetched_configs, existing_configs]
+    candidate_configs = select_candidate_configs(source_sets, MAX_SOURCE_CANDIDATES)
+    candidate_set = set(candidate_configs)
+    testable_configs = sorted(c for c in candidate_set if get_config_scheme(c) in XRAY_SUPPORTED_SCHEMES)
+    untestable_configs = sorted(c for c in candidate_set if get_config_scheme(c) not in XRAY_SUPPORTED_SCHEMES)
 
-    print(f"\n✅ استخراج تمام شد. مجموعاً {len(all_found_configs)} کانفیگ پیدا شد.")
+    print(f"\n✅ استخراج تمام شد. مجموعاً {len(all_found_configs)} کانفیگ پیدا شد؛ {len(candidate_configs)} کاندید برای تست انتخاب شد.")
     print(f"   ↳ {len(testable_configs)} عدد قابل تست با Xray | {len(untestable_configs)} عدد خارج از توان Xray (بدون تست اضافه می‌شوند)")
 
     if not all_found_configs:
@@ -426,6 +537,21 @@ async def main():
     else:
         with open(OUTPUT_FILE, "w") as f: f.write("")
         print("هیچ کانفیگ سالمی یافت نشد. فایل سابسکریپشن خالی شد.")
+
+    # خروجی مستقل Top-100: فقط کانفیگ‌هایی که تست واقعی موفق داشته‌اند.
+    top_configs = [res[1] for res in successful_results[:TOP_CONFIGS]]
+    if top_configs:
+        top_content = "\n".join(top_configs)
+        top_encoded = base64.b64encode(top_content.encode("utf-8")).decode("ascii")
+        temp_top = f"{TOP_OUTPUT_FILE}.tmp"
+        with open(temp_top, "w", encoding="ascii") as f:
+            f.write(top_encoded)
+        os.replace(temp_top, TOP_OUTPUT_FILE)
+        print(f"🚀 خروجی Top-100 با {len(top_configs)} کانفیگ سالم تولید شد: {TOP_OUTPUT_FILE}")
+        if GITHUB_REPOSITORY:
+            print(f"🔗 لینک سابسکریپشن: https://raw.githubusercontent.com/{GITHUB_REPOSITORY}/main/{TOP_OUTPUT_FILE}")
+    else:
+        print(f"⚠️ هیچ کانفیگ سالمی برای {TOP_OUTPUT_FILE} پیدا نشد؛ خروجی قبلی حفظ شد.")
 
 if __name__ == "__main__":
     if not all([API_ID, API_HASH, SESSION_STRING]):
